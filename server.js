@@ -1,10 +1,9 @@
-// server.js - Congressional Trading Bot (No Quiver Required)
+// server.js - Congressional Trading Bot (Email-Only, No Twilio)
 const express = require('express');
 const cors = require('cors');
 const cron = require('node-cron');
 const axios = require('axios');
 const nodemailer = require('nodemailer');
-const twilio = require('twilio');
 const sqlite3 = require('sqlite3').verbose();
 require('dotenv').config();
 
@@ -15,8 +14,7 @@ const PORT = process.env.PORT || 3001;
 app.use(cors());
 app.use(express.json());
 
-// Initialize services
-const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+// Initialize email service only
 const emailTransporter = nodemailer.createTransporter({
   service: 'gmail',
   auth: {
@@ -123,7 +121,6 @@ async function updatePortfolioValues() {
     const priceData = await getStockPrice(symbol);
     if (priceData) {
       userPortfolio.positions[symbol].currentPrice = priceData.price;
-      // Calculate shares if we have target value but no shares set
       if (userPortfolio.positions[symbol].shares === 0) {
         userPortfolio.positions[symbol].shares = 
           userPortfolio.positions[symbol].currentValue / priceData.price;
@@ -133,10 +130,9 @@ async function updatePortfolioValues() {
     }
     
     // Avoid rate limiting (Alpha Vantage: 5 calls/minute)
-    await new Promise(resolve => setTimeout(resolve, 15000)); // 15 second delay
+    await new Promise(resolve => setTimeout(resolve, 15000));
   }
   
-  // Calculate total portfolio value
   const totalPositionValue = Object.values(userPortfolio.positions)
     .reduce((sum, pos) => sum + pos.currentValue, 0);
   userPortfolio.totalValue = totalPositionValue + userPortfolio.cash;
@@ -146,8 +142,6 @@ async function updatePortfolioValues() {
 }
 
 // ===== DATA FETCHING (FREE SOURCES) =====
-
-// Source 1: House Stock Watcher (Free, GitHub hosted)
 async function fetchHouseStockWatcher() {
   try {
     console.log('🔍 Fetching from House Stock Watcher...');
@@ -157,7 +151,7 @@ async function fetchHouseStockWatcher() {
       .filter(trade => {
         const tradeDate = new Date(trade.transaction_date);
         const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-        return tradeDate > sevenDaysAgo; // Only recent trades
+        return tradeDate > sevenDaysAgo;
       })
       .map(trade => ({
         Representative: trade.representative,
@@ -170,8 +164,8 @@ async function fetchHouseStockWatcher() {
       .filter(trade => 
         trade.Representative && 
         trade.Ticker && 
-        TOP_PERFORMERS[trade.Representative] && // Only track our top performers
-        userPortfolio.positions[trade.Ticker] // Only track our portfolio stocks
+        TOP_PERFORMERS[trade.Representative] && 
+        userPortfolio.positions[trade.Ticker]
       );
     
     console.log(`📊 Found ${trades.length} relevant trades from House Stock Watcher`);
@@ -183,7 +177,6 @@ async function fetchHouseStockWatcher() {
   }
 }
 
-// Source 2: Manual trade entry for testing/backup
 async function fetchManualTrades() {
   return new Promise((resolve) => {
     db.all(
@@ -192,7 +185,6 @@ async function fetchManualTrades() {
         if (err || !rows) {
           resolve([]);
         } else {
-          // Mark as processed
           db.run('UPDATE manual_trades SET processed = 1 WHERE processed = 0');
           
           const trades = rows.map(row => ({
@@ -212,17 +204,14 @@ async function fetchManualTrades() {
   });
 }
 
-// Main data fetching function
 async function fetchCongressionalTrades() {
   console.log('🔍 Fetching congressional trades from free sources...');
   
   let allTrades = [];
   
-  // Try House Stock Watcher
   const hswTrades = await fetchHouseStockWatcher();
   allTrades = allTrades.concat(hswTrades);
   
-  // Try manual trades
   const manualTrades = await fetchManualTrades();
   allTrades = allTrades.concat(manualTrades);
   
@@ -247,8 +236,7 @@ function calculatePositionAdjustment(symbol, traderAction, traderName, amount) {
     confidence: 0
   };
   
-  // Calculate trade impact based on trader importance and amount
-  const tradeImpact = Math.min((amount / 1000000) * traderWeight, 0.15); // Max 15% adjustment
+  const tradeImpact = Math.min((amount / 1000000) * traderWeight, 0.15);
   
   if (traderAction === 'Purchase' || traderAction === 'Buy') {
     const newTargetAllocation = Math.min(targetAllocation + tradeImpact, 0.35);
@@ -280,25 +268,7 @@ function calculatePositionAdjustment(symbol, traderAction, traderName, amount) {
   return recommendation;
 }
 
-// ===== ALERT FUNCTIONS =====
-async function sendSMS(message) {
-  if (!process.env.TWILIO_ACCOUNT_SID || !process.env.YOUR_PHONE_NUMBER) {
-    console.log('📱 SMS not configured, skipping...');
-    return;
-  }
-  
-  try {
-    await twilioClient.messages.create({
-      body: message,
-      from: process.env.TWILIO_PHONE_NUMBER,
-      to: process.env.YOUR_PHONE_NUMBER
-    });
-    console.log('📱 SMS sent successfully');
-  } catch (error) {
-    console.error('SMS failed:', error.message);
-  }
-}
-
+// ===== EMAIL ALERT FUNCTIONS =====
 async function sendEmail(subject, htmlBody) {
   if (!process.env.EMAIL_USER) {
     console.log('📧 Email not configured, skipping...');
@@ -321,61 +291,70 @@ async function sendEmail(subject, htmlBody) {
 async function sendBuyRecommendation(recommendation) {
   const { symbol, action, currentPrice, recommendedAmount, sharesToTrade, reason, confidence } = recommendation;
   
-  // SMS Alert for urgent trades
-  if (confidence > 0.7) {
-    const smsMessage = `🚨 ${action}: ${symbol}\n` +
-      `Amount: $${recommendedAmount.toFixed(0)}\n` +
-      `Price: $${currentPrice.toFixed(2)}\n` +
-      `Shares: ${sharesToTrade.toFixed(3)}\n` +
-      `Confidence: ${(confidence * 100).toFixed(0)}%\n` +
-      `${reason.substring(0, 100)}`;
-    
-    await sendSMS(smsMessage);
-  }
-  
-  // Detailed Email Alert
-  const emailSubject = `${action} Alert: ${symbol} - $${recommendedAmount.toFixed(0)}`;
+  const emailSubject = `🚨 ${action} ALERT: ${symbol} - $${recommendedAmount.toFixed(0)}`;
   const emailBody = `
-    <h2>🎯 ${action} RECOMMENDATION</h2>
-    <div style="background: #f5f5f5; padding: 20px; border-radius: 10px; margin: 20px 0;">
-      <h3>${symbol} - ${action} $${recommendedAmount.toFixed(0)}</h3>
-      <p><strong>Current Price:</strong> $${currentPrice.toFixed(2)}</p>
-      <p><strong>Shares to ${action.toLowerCase()}:</strong> ${sharesToTrade.toFixed(3)}</p>
-      <p><strong>Confidence:</strong> ${(confidence * 100).toFixed(0)}%</p>
+    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+      <div style="background: ${action === 'BUY' ? '#e8f5e8' : '#ffe8e8'}; padding: 20px; border-radius: 10px; margin: 20px 0;">
+        <h2 style="margin: 0; color: ${action === 'BUY' ? '#2e7d32' : '#d32f2f'};">
+          🚨 ${action} RECOMMENDATION
+        </h2>
+        <h3 style="margin: 10px 0;">${symbol} - ${action} $${recommendedAmount.toFixed(0)}</h3>
+      </div>
+      
+      <div style="background: #f5f5f5; padding: 20px; border-radius: 10px; margin: 20px 0;">
+        <h3>📊 Trade Details</h3>
+        <p><strong>Current Price:</strong> $${currentPrice.toFixed(2)}</p>
+        <p><strong>Shares to ${action.toLowerCase()}:</strong> ${sharesToTrade.toFixed(3)}</p>
+        <p><strong>Confidence Level:</strong> ${(confidence * 100).toFixed(0)}%</p>
+        <p><strong>Urgency:</strong> ${confidence > 0.85 ? 'HIGH - Act within 1 hour' : confidence > 0.7 ? 'MEDIUM - Act within 4 hours' : 'LOW - Act within 24 hours'}</p>
+      </div>
+      
+      <div style="background: #e3f2fd; padding: 20px; border-radius: 10px; margin: 20px 0;">
+        <h3>🧠 Analysis</h3>
+        <p>${reason}</p>
+      </div>
+      
+      <div style="background: #fff3e0; padding: 20px; border-radius: 10px; margin: 20px 0;">
+        <h3>💼 Portfolio Impact</h3>
+        <p><strong>Current ${symbol} value:</strong> $${userPortfolio.positions[symbol].currentValue.toFixed(2)}</p>
+        <p><strong>After ${action}:</strong> $${(userPortfolio.positions[symbol].currentValue + (action === 'BUY' ? recommendedAmount : -recommendedAmount)).toFixed(2)}</p>
+        <p><strong>New allocation:</strong> ${((userPortfolio.positions[symbol].currentValue + (action === 'BUY' ? recommendedAmount : -recommendedAmount)) / userPortfolio.totalValue * 100).toFixed(1)}%</p>
+      </div>
+      
+      <div style="background: #f3e5f5; padding: 20px; border-radius: 10px; margin: 20px 0;">
+        <h3>📱 Step-by-Step Instructions</h3>
+        <ol style="line-height: 1.8;">
+          <li><strong>Open your brokerage app</strong> (Robinhood, Fidelity, Schwab, etc.)</li>
+          <li><strong>Search for "${symbol}"</strong></li>
+          <li><strong>Choose order type:</strong> Market ${action === 'BUY' ? 'Buy' : 'Sell'} Order</li>
+          <li><strong>Enter amount:</strong>
+            <ul>
+              <li>Dollar amount: $${recommendedAmount.toFixed(0)}</li>
+              <li>OR Share amount: ${sharesToTrade.toFixed(3)} shares</li>
+            </ul>
+          </li>
+          <li><strong>Review and submit</strong> the order</li>
+          <li><strong>Confirm execution</strong> and update your records</li>
+        </ol>
+      </div>
+      
+      <div style="text-align: center; padding: 20px; color: #666; font-size: 12px;">
+        <p>Generated at ${new Date().toLocaleString()}</p>
+        <p>Congressional Trading Bot - Following the most successful traders in Congress</p>
+      </div>
     </div>
-    
-    <h3>📊 Analysis</h3>
-    <p>${reason}</p>
-    
-    <h3>💼 Portfolio Impact</h3>
-    <p><strong>Current ${symbol} value:</strong> $${userPortfolio.positions[symbol].currentValue.toFixed(2)}</p>
-    <p><strong>After ${action}:</strong> $${(userPortfolio.positions[symbol].currentValue + (action === 'BUY' ? recommendedAmount : -recommendedAmount)).toFixed(2)}</p>
-    
-    <h3>📱 How to Execute</h3>
-    <ol>
-      <li>Open your brokerage app (Robinhood, Fidelity, etc.)</li>
-      <li>Search for "${symbol}"</li>
-      <li>${action === 'BUY' ? 'Place a market buy order' : 'Place a market sell order'}</li>
-      <li>Amount: $${recommendedAmount.toFixed(0)} OR ${sharesToTrade.toFixed(3)} shares</li>
-      <li>Review and submit</li>
-    </ol>
-    
-    <p style="color: #666; font-size: 12px;">
-      Generated at ${new Date().toLocaleString()}<br>
-      Congressional Trading Bot
-    </p>
   `;
   
   await sendEmail(emailSubject, emailBody);
   
-  // Save recommendation to database
+  // Save recommendation
   db.run(
     `INSERT INTO recommendations (symbol, action, current_price, recommended_amount, shares_to_trade, reason, confidence) 
      VALUES (?, ?, ?, ?, ?, ?, ?)`,
     [symbol, action, currentPrice, recommendedAmount, sharesToTrade, reason, confidence]
   );
   
-  console.log(`📨 ${action} recommendation sent for ${symbol}: $${recommendedAmount.toFixed(0)}`);
+  console.log(`📧 ${action} alert sent via email for ${symbol}: $${recommendedAmount.toFixed(0)}`);
 }
 
 // ===== MAIN PROCESSING =====
@@ -386,7 +365,6 @@ async function processNewTrades() {
     const trades = await fetchCongressionalTrades();
     
     for (const trade of trades) {
-      // Check if already processed
       const existing = await new Promise((resolve) => {
         db.get(
           'SELECT id FROM trades WHERE trader_name = ? AND symbol = ? AND trade_date = ? AND amount = ?',
@@ -397,7 +375,6 @@ async function processNewTrades() {
       
       if (existing) continue;
       
-      // Save new trade
       db.run(
         `INSERT INTO trades (trader_name, symbol, transaction_type, amount, trade_date, disclosure_date) 
          VALUES (?, ?, ?, ?, ?, ?)`,
@@ -412,10 +389,8 @@ async function processNewTrades() {
       if (TOP_PERFORMERS[traderName] && userPortfolio.positions[symbol]) {
         console.log(`🎯 Analyzing trade: ${traderName} ${transactionType} ${symbol} $${amount.toLocaleString()}`);
         
-        // Update current portfolio values
         await updatePortfolioValues();
         
-        // Calculate recommendation
         const recommendation = calculatePositionAdjustment(symbol, transactionType, traderName, amount);
         
         if (recommendation.action !== 'HOLD' && recommendation.confidence > 0.6) {
@@ -430,24 +405,15 @@ async function processNewTrades() {
 }
 
 // ===== API ENDPOINTS =====
-
-// Test endpoints
-app.get('/api/test-sms', async (req, res) => {
-  await sendSMS('🤖 Congressional Trading Bot test - SMS working!');
-  res.json({ message: 'Test SMS sent' });
-});
-
 app.get('/api/test-email', async (req, res) => {
   await sendEmail('🤖 Bot Test', '<h2>Congressional Trading Bot is working!</h2><p>Email alerts are configured correctly.</p>');
   res.json({ message: 'Test email sent' });
 });
 
-// Portfolio endpoints
 app.get('/api/portfolio', (req, res) => {
   res.json(userPortfolio);
 });
 
-// Manual trade entry for testing
 app.post('/api/manual-trade', async (req, res) => {
   const { trader, symbol, type, amount } = req.body;
   
@@ -468,14 +434,12 @@ app.post('/api/manual-trade', async (req, res) => {
           trade: { trader, symbol, type, amount }
         });
         
-        // Process immediately
         setTimeout(processNewTrades, 1000);
       }
     }
   );
 });
 
-// Trigger endpoints
 app.post('/api/trigger/trades', async (req, res) => {
   await processNewTrades();
   res.json({ message: 'Trade processing triggered' });
@@ -498,6 +462,8 @@ app.get('/', (req, res) => {
           <p><strong>Total Value:</strong> $${userPortfolio.totalValue.toFixed(2)}</p>
           <p><strong>Cash:</strong> $${userPortfolio.cash.toFixed(2)}</p>
           <p><strong>Last Updated:</strong> ${userPortfolio.lastUpdated.toLocaleString()}</p>
+          <p><strong>Email Configured:</strong> ${process.env.EMAIL_USER ? '✅ Yes' : '❌ No'}</p>
+          <p><strong>API Key Configured:</strong> ${process.env.ALPHA_VANTAGE_API_KEY ? '✅ Yes' : '❌ No'}</p>
         </div>
         
         <div style="background: white; padding: 20px; border-radius: 10px; margin: 20px 0;">
@@ -509,7 +475,6 @@ app.get('/', (req, res) => {
         
         <div style="background: white; padding: 20px; border-radius: 10px; margin: 20px 0;">
           <h2>🧪 Test Functions</h2>
-          <a href="/api/test-sms" style="margin: 10px; padding: 10px; background: #007bff; color: white; text-decoration: none; border-radius: 5px;">Test SMS</a>
           <a href="/api/test-email" style="margin: 10px; padding: 10px; background: #28a745; color: white; text-decoration: none; border-radius: 5px;">Test Email</a>
           <a href="/api/trigger/update-prices" style="margin: 10px; padding: 10px; background: #ffc107; color: black; text-decoration: none; border-radius: 5px;">Update Prices</a>
         </div>
@@ -549,7 +514,6 @@ app.get('/', (req, res) => {
               body: JSON.stringify({trader, symbol, type, amount: parseFloat(amount)})
             }).then(res => res.json()).then(data => {
               alert('Trade added: ' + data.message);
-              // Clear form
               document.getElementById('trader').value = '';
               document.getElementById('symbol').value = '';
               document.getElementById('amount').value = '';
@@ -561,9 +525,7 @@ app.get('/', (req, res) => {
   `);
 });
 
-// ===== SCHEDULED JOBS =====
-
-// Check for new trades every 2 hours during market hours (9 AM - 4 PM EST, Mon-Fri)
+// Scheduled jobs
 cron.schedule('0 9,11,13,15 * * 1-5', async () => {
   console.log('⏰ Scheduled trade check...');
   await processNewTrades();
@@ -571,18 +533,9 @@ cron.schedule('0 9,11,13,15 * * 1-5', async () => {
   timezone: "America/New_York"
 });
 
-// Update portfolio values twice daily (market open and close)
 cron.schedule('0 9,16 * * 1-5', async () => {
   console.log('⏰ Scheduled portfolio update...');
   await updatePortfolioValues();
-}, {
-  timezone: "America/New_York"
-});
-
-// Weekly check on Sunday mornings
-cron.schedule('0 10 * * 0', async () => {
-  console.log('⏰ Weekly system check...');
-  await processNewTrades();
 }, {
   timezone: "America/New_York"
 });
@@ -592,22 +545,16 @@ setTimeout(async () => {
   console.log('🚀 Congressional Trading Bot starting up...');
   console.log('💰 Portfolio value: $' + userPortfolio.totalValue.toFixed(2));
   console.log('📊 Data sources: House Stock Watcher + Manual Entry');
-  console.log('📅 Schedule: Every 2 hours during market hours');
-  
-  // Send startup confirmation
-  await sendSMS('🤖 Congressional Trading Bot is now active! Using free data sources. Add manual trades to test alerts.');
-  
-  console.log('✅ Bot initialized and ready!');
+  console.log('📧 Email configured:', !!process.env.EMAIL_USER);
+  console.log('🔑 API key configured:', !!process.env.ALPHA_VANTAGE_API_KEY);
+  console.log('✅ Bot initialized and ready! (Email-only mode)');
 }, 3000);
 
-// Start server
 app.listen(PORT, () => {
   console.log(`🚀 Congressional Trading Bot running on port ${PORT}`);
-  console.log(`📊 Dashboard: http://localhost:${PORT}`);
-  console.log('🔑 No premium APIs required - using free sources!');
+  console.log('📧 Email-only mode - No SMS required!');
 });
 
-// Graceful shutdown
 process.on('SIGTERM', () => {
   console.log('🛑 Shutting down gracefully...');
   db.close();
